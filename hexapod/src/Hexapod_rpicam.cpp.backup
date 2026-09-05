@@ -1,0 +1,394 @@
+// Hexapod_rpicam.cpp
+// ------------------------------------------------------------
+// Updated version that uses a modern DNN face detector
+// (OpenCV DNN + Caffe SSD‑ResNet10) instead of Haar cascades.
+// ------------------------------------------------------------
+
+#include "Hexapod.h"
+#include <libcamera/libcamera.h>
+#include <libcamera/controls.h>
+#include <opencv2/opencv.hpp>
+#include <opencv2/dnn.hpp>
+#include <iostream>
+#include <memory>
+#include <vector>
+#include <thread>
+#include <queue>
+#include <mutex>
+#include <condition_variable>
+#include <signal.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <sys/mman.h>
+#include <cstring>
+extern "C" {
+#include <libavcodec/avcodec.h>
+#include <libavformat/avformat.h>
+#include <libavutil/opt.h>
+#include <libswscale/swscale.h>
+}
+using namespace libcamera;
+using namespace std::chrono_literals;
+
+/* ---------- global state ---------- */
+static std::shared_ptr<Camera> camera;
+static volatile bool running = true;
+
+/* UDP packet queue + sender thread */
+static std::queue<std::vector<uint8_t>> packet_queue;
+static std::mutex queue_mutex;
+static std::condition_variable queue_cv;
+static std::thread sender_thread;
+static int udp_sock = -1;
+static struct sockaddr_in dest_addr{};
+
+/* OpenCV DNN face detector */
+static cv::dnn::Net faceNet;                     // the DNN model
+static const float DNN_CONF_THRESH = 0.5f;       // confidence threshold (tune if needed)
+
+/* Haar cascades – kept only for optional fallback */
+static cv::CascadeClassifier face_cascade;
+static cv::CascadeClassifier profile_cascade;
+
+/* ---------- helper functions ---------- */
+static void sigint_handler(int) { running = false; }
+
+static void init_udp(const char *host, int port) {
+    udp_sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (udp_sock < 0) return;
+    dest_addr.sin_family = AF_INET;
+    dest_addr.sin_port   = htons(port);
+    inet_pton(AF_INET, host, &dest_addr.sin_addr);
+}
+
+static void sender_worker() {
+    while (running) {
+        std::unique_lock<std::mutex> lock(queue_mutex);
+        queue_cv.wait(lock, [] { return !packet_queue.empty() || !running; });
+        if (!running) break;
+        auto pkt = std::move(packet_queue.front());
+        packet_queue.pop();
+        lock.unlock();
+        sendto(udp_sock, pkt.data(), pkt.size(), 0,
+               (struct sockaddr*)&dest_addr, sizeof(dest_addr));
+    }
+}
+
+/* -------------------------------------------------
+   Load the DNN model (Caffe SSD‑ResNet10)
+   Returns true on success, false on failure.
+   ------------------------------------------------- */
+static bool loadFaceNet(const std::string& prototxt,
+                        const std::string& caffemodel)
+{
+    try {
+        faceNet = cv::dnn::readNetFromCaffe(prototxt, caffemodel);
+        // Force CPU inference – the Pi does not have a CUDA/OpenCL device
+        faceNet.setPreferableBackend(cv::dnn::DNN_BACKEND_DEFAULT);
+        faceNet.setPreferableTarget(cv::dnn::DNN_TARGET_CPU);
+        std::cout << "DNN face model loaded successfully.\n";
+        return true;
+    } catch (const cv::Exception& e) {
+        std::cerr << "Failed to load DNN face model: " << e.what() << "\n";
+        return false;
+    }
+}
+
+/* -------------------------------------------------
+   requestComplete – main per‑frame processing routine
+   ------------------------------------------------- */
+static void requestComplete(Request *request) {
+    if (request->status() == Request::RequestCancelled || !running)
+        return;
+
+    const auto &buffers = request->buffers();
+    for (const auto &pair : buffers) {
+        FrameBuffer *buf = pair.second;
+        const FrameMetadata &meta = buf->metadata();
+        const auto &planes = buf->planes();
+        if (planes.size() < 2) {
+            request->reuse(Request::ReuseBuffers);
+            camera->queueRequest(request);
+            return;
+        }
+
+        /* ---- mmap NV12 planes ---- */
+        size_t total = planes[1].offset + planes[1].length;
+        long page    = sysconf(_SC_PAGESIZE);
+        size_t aligned = (total + page - 1) & ~(page - 1);
+        void *addr = mmap(nullptr, aligned, PROT_READ, MAP_SHARED,
+                          planes[0].fd.get(), 0);
+        if (addr == MAP_FAILED) {
+            std::cerr << "mmap failed\n";
+            request->reuse(Request::ReuseBuffers);
+            camera->queueRequest(request);
+            return;
+        }
+
+        uint8_t *y  = static_cast<uint8_t*>(addr) + planes[0].offset;
+        size_t   ys = planes[0].length;
+        uint8_t *uv = static_cast<uint8_t*>(addr) + planes[1].offset;
+        size_t   uvs = planes[1].length;
+        if (ys == 0 || uvs == 0) {
+            munmap(addr, aligned);
+            request->reuse(Request::ReuseBuffers);
+            camera->queueRequest(request);
+            return;
+        }
+
+        /* ---- NV12 → BGR (OpenCV) ---- */
+        const int w = 320, h = 240;
+        cv::Mat nv12(h * 3 / 2, w, CV_8UC1);
+        memcpy(nv12.data,          y,  ys);
+        memcpy(nv12.data + ys,    uv, uvs);
+        cv::Mat bgr;
+        cv::cvtColor(nv12, bgr, cv::COLOR_YUV2BGR_NV12);
+
+        /* -------------------------------------------------
+           Face detection – DNN (fallback to Haar if needed)
+           ------------------------------------------------- */
+        cv::Rect max_face;
+        double   max_area = 0.0;
+        int      centroid_x = 0, centroid_y = 0;
+
+        if (!faceNet.empty()) {                     // ----- DNN path -----
+            cv::Mat blob = cv::dnn::blobFromImage(
+                    bgr,                     // input image (BGR)
+                    1.0,                     // scale factor
+                    cv::Size(300, 300),      // network expects 300×300
+                    cv::Scalar(104.0, 177.0, 123.0), // mean (Caffe model)
+                    false, false);           // swapRB, crop
+
+            faceNet.setInput(blob);
+            cv::Mat detections = faceNet.forward();   // shape: [1,1,N,7]
+
+            // Number of detections = size[2]
+            int numDetections = detections.size[2];
+            for (int i = 0; i < numDetections; ++i) {
+                // pointer to the i‑th detection row (length 7)
+                const float* data = detections.ptr<float>(0, 0, i);
+                float confidence = data[2];
+                if (confidence < DNN_CONF_THRESH) continue;
+
+                float x1 = data[3] * bgr.cols;
+                float y1 = data[4] * bgr.rows;
+                float x2 = data[5] * bgr.cols;
+                float y2 = data[6] * bgr.rows;
+
+                cv::Rect r(cv::Point(static_cast<int>(x1), static_cast<int>(y1)),
+                           cv::Point(static_cast<int>(x2), static_cast<int>(y2)));
+                double area = r.width * r.height;
+                if (area > max_area) {
+                    max_area = area;
+                    max_face = r;
+                }
+            }
+        } else {                                    // ----- Haar fallback -----
+            cv::Mat gray;
+            cv::cvtColor(bgr, gray, cv::COLOR_BGR2GRAY);
+            std::vector<cv::Rect> frontal_faces, profile_faces;
+            face_cascade.detectMultiScale(gray, frontal_faces,
+                                          1.1, 5, 0,
+                                          cv::Size(30,30));
+            profile_cascade.detectMultiScale(gray, profile_faces,
+                                             1.2, 5, 0,
+                                             cv::Size(30,30));
+            // merge both vectors
+            std::vector<cv::Rect> all = frontal_faces;
+            all.insert(all.end(), profile_faces.begin(), profile_faces.end());
+
+            for (const auto &r : all) {
+                double area = r.width * r.height;
+                if (area > max_area) {
+                    max_area = area;
+                    max_face = r;
+                }
+            }
+        }
+
+        if (max_area > 0.0) {
+            centroid_x = max_face.x + max_face.width / 2;
+            centroid_y = max_face.y + max_face.height / 2;
+
+            // ---- optional visual debugging (tiny red cross + text) ----
+            int cross = 5;
+            cv::line(bgr,
+                     cv::Point(centroid_x - cross, centroid_y),
+                     cv::Point(centroid_x + cross, centroid_y),
+                     cv::Scalar(0,0,255), 2);
+            cv::line(bgr,
+                     cv::Point(centroid_x, centroid_y - cross),
+                     cv::Point(centroid_x, centroid_y + cross),
+                     cv::Scalar(0,0,255), 2);
+            std::string txt = "X:" + std::to_string(centroid_x) +
+                              " Y:" + std::to_string(centroid_y);
+            cv::putText(bgr, txt, cv::Point(10,30),
+                        cv::FONT_HERSHEY_SIMPLEX, 0.6,
+                        cv::Scalar(255,255,255), 2);
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(face_mutex);
+            latest_faces.num_faces = (max_area > 0.0) ? 1 : 0;
+            latest_faces.centroid_x = centroid_x;
+            latest_faces.centroid_y = centroid_y;
+        }
+
+        /* -------------------------------------------------
+           BGR → YUV420P (for x264) – unchanged
+           ------------------------------------------------- */
+        static SwsContext *sws = nullptr;
+        static bool sws_init = false;
+        if (!sws_init) {
+            sws = sws_getContext(w, h, AV_PIX_FMT_BGR24,
+                                 w, h, AV_PIX_FMT_YUV420P,
+                                 SWS_BILINEAR, nullptr, nullptr, nullptr);
+            sws_init = true;
+        }
+
+        AVFrame *yuv = av_frame_alloc();
+        yuv->format = AV_PIX_FMT_YUV420P;
+        yuv->width  = w;
+        yuv->height = h;
+        av_frame_get_buffer(yuv, 0);
+        yuv->linesize[0] = w;
+        yuv->linesize[1] = yuv->linesize[2] = w / 2;
+
+        uint8_t *bgr_src[4] = { bgr.data, nullptr, nullptr, nullptr };
+        int      bgr_ls [4] = { (int)bgr.step, 0, 0, 0 };
+        sws_scale(sws, bgr_src, bgr_ls, 0, h,
+                  yuv->data, yuv->linesize);
+        yuv->pts = meta.sequence;
+
+        /* -------------------------------------------------
+           H.264 encode (I‑frame every frame) – unchanged
+           ------------------------------------------------- */
+        static AVCodecContext *cctx = nullptr;
+        static AVPacket       *pkt  = nullptr;
+        static bool ff_init = false;
+        if (!ff_init) {
+            const AVCodec *codec = avcodec_find_encoder(AV_CODEC_ID_H264);
+            cctx = avcodec_alloc_context3(codec);
+            cctx->width     = w;
+            cctx->height    = h;
+            cctx->pix_fmt   = AV_PIX_FMT_YUV420P;
+            cctx->time_base = {1, 30};
+            cctx->bit_rate  = 4'000'000;
+            cctx->gop_size  = 1;                         // I‑frame every frame
+            av_opt_set(cctx->priv_data, "preset", "ultrafast", 0);
+            av_opt_set(cctx->priv_data, "tune",   "zerolatency", 0);
+            avcodec_open2(cctx, codec, nullptr);
+            pkt = av_packet_alloc();
+            ff_init = true;
+        }
+
+        avcodec_send_frame(cctx, yuv);
+        while (avcodec_receive_packet(cctx, pkt) == 0) {
+            std::vector<uint8_t> data(pkt->data, pkt->data + pkt->size);
+            {
+                std::lock_guard<std::mutex> lk(queue_mutex);
+                packet_queue.push(std::move(data));
+            }
+            queue_cv.notify_one();
+            av_packet_unref(pkt);
+        }
+        av_frame_free(&yuv);
+        munmap(addr, aligned);
+    }
+
+    request->reuse(Request::ReuseBuffers);
+    camera->queueRequest(request);
+}
+
+/* ---------- main ---------- */
+int hexapod_rpicam_main(int argc, char** argv)
+{
+    signal(SIGINT, sigint_handler);
+    init_udp("10.10.10.4", 5000);
+    sender_thread = std::thread(sender_worker);
+
+    /* -------------------------------------------------
+       Load the DNN model.  If that fails we load the old
+       Haar cascades so the program still runs (just slower).
+       ------------------------------------------------- */
+    const std::string proto = "/usr/local/share/face_detector/deploy.prototxt";
+    const std::string model = "/usr/local/share/face_detector/res10_300x300_ssd_iter_140000.caffemodel";
+
+    bool dnn_ok = loadFaceNet(proto, model);
+    if (!dnn_ok) {
+        std::cerr << "WARNING: DNN model not loaded – falling back to Haar cascades.\n";
+        if (!face_cascade.load("/usr/share/opencv4/haarcascades/haarcascade_frontalface_default.xml")) {
+            std::cerr << "Failed to load frontal cascade\n";
+            return 1;
+        }
+        if (!profile_cascade.load("/usr/share/opencv4/haarcascades/haarcascade_profileface.xml")) {
+            std::cerr << "Failed to load profile cascade (optional)\n";
+        }
+    }
+
+    std::unique_ptr<CameraManager> cm = std::make_unique<CameraManager>();
+    cm->start();
+    auto cams = cm->cameras();
+    if (cams.empty()) {
+        std::cerr << "No cameras\n";
+        return 1;
+    }
+    camera = cm->get(cams[0]->id());
+    if (!camera) {
+        std::cerr << "Cannot get camera\n";
+        return 1;
+    }
+    camera->acquire();
+
+    auto cfg = camera->generateConfiguration({StreamRole::VideoRecording});
+    StreamConfiguration &sc = cfg->at(0);
+    sc.size.width  = 320;
+    sc.size.height = 240;
+    sc.pixelFormat = formats::NV12;
+    cfg->validate();
+    camera->configure(cfg.get());
+
+    ControlList ctrl;
+    ctrl.set(controls::AeEnable, true);
+    ctrl.set(controls::AwbEnable, true);
+    ctrl.set(controls::Saturation, 1.0f);
+    ctrl.set(controls::Sharpness, 1.5f);
+    ctrl.set(controls::draft::NoiseReductionMode,
+             controls::draft::NoiseReductionModeOff);
+
+    FrameBufferAllocator alloc(camera);
+    for (auto &s : *cfg)
+        alloc.allocate(s.stream());
+
+    camera->start(&ctrl);
+    Stream *stream = sc.stream();
+    const auto &bufs = alloc.buffers(stream);
+    std::vector<std::unique_ptr<Request>> reqs;
+    for (unsigned i = 0; i < bufs.size(); ++i) {
+        auto r = camera->createRequest();
+        r->addBuffer(stream, bufs[i].get());
+        reqs.push_back(std::move(r));
+    }
+
+    camera->requestCompleted.connect(requestComplete);
+    for (auto &r : reqs)
+        camera->queueRequest(r.get());
+
+    std::cout << "Hexapod camera streaming to 10.10.10.4:5000 (Ctrl‑C to stop)\n";
+
+    while (running)
+        std::this_thread::sleep_for(100ms);
+
+    /* ---- cleanup ---- */
+    camera->stop();
+    alloc.free(stream);
+    camera->release();
+    cm->stop();
+    close(udp_sock);
+    running = false;
+    queue_cv.notify_all();
+    sender_thread.join();
+    return 0;
+}
